@@ -817,14 +817,25 @@ async function rankCustomers(supabase: DB, args: Record<string, unknown>): Promi
     if (error) return fail(error.message);
     for (const b of data ?? []) add(b.customer_id, num(b.total));
   } else {
-    const { data, error } = await supabase
-      .from("customer_balances")
-      .select(sel("customer_id, current_balance"))
-      .limit(5000)
-      .returns<Array<{ customer_id: string; current_balance: number }>>();
-    if (error) return fail(error.message);
-    for (const b of data ?? []) add(b.customer_id, num(b.current_balance));
+    const [{ data: bal }, { data: custs }] = await Promise.all([
+      supabase
+        .from("customer_balances")
+        .select(sel("customer_id, current_balance"))
+        .limit(5000)
+        .returns<Array<{ customer_id: string; current_balance: number }>>(),
+      supabase
+        .from("customers")
+        .select(sel("id, balance"))
+        .limit(5000)
+        .returns<Array<{ id: string; balance: number }>>(),
+    ]);
+    const ledger = new Map((bal ?? []).map((b) => [b.customer_id, num(b.current_balance)]));
+    for (const c of custs ?? []) {
+      const v = ledger.has(c.id) ? ledger.get(c.id)! : num(c.balance);
+      if (v !== 0) add(c.id, v);
+    }
   }
+
 
   const ranked = [...totals.entries()]
     .sort((a, b) => (asc ? a[1] - b[1] : b[1] - a[1]))
