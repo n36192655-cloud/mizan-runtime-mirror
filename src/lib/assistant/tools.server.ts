@@ -718,10 +718,10 @@ async function summaryStats(supabase: DB, args: Record<string, unknown>): Promis
     paysQ.limit(5000).returns<Array<{ amount: number; status: string }>>(),
     readsQ.limit(5000).returns<Array<{ consumption: number | null; status: string }>>(),
     prodQ.limit(5000).returns<Array<{ produced_m3: number }>>(),
-    supabase.from("customers").select(sel("id, status"), { count: "exact", head: false }).limit(5000)
-      .returns<Array<{ id: string; status: string }>>(),
-    supabase.from("customer_balances").select(sel("current_balance")).limit(5000)
-      .returns<Array<{ current_balance: number }>>(),
+    supabase.from("customers").select(sel("id, status, balance")).limit(5000)
+      .returns<Array<{ id: string; status: string; balance: number }>>(),
+    supabase.from("customer_balances").select(sel("customer_id, current_balance")).limit(5000)
+      .returns<Array<{ customer_id: string; current_balance: number }>>(),
   ]);
 
   const bills = billsR.data ?? [];
@@ -732,7 +732,13 @@ async function summaryStats(supabase: DB, args: Record<string, unknown>): Promis
   const consumed = reads.reduce((s, r) => s + num(r.consumption), 0);
   const produced = (prodR.data ?? []).reduce((s, p) => s + num(p.produced_m3), 0);
   const customers = custR.data ?? [];
-  const outstanding = (balR.data ?? []).reduce((s, b) => s + Math.max(num(b.current_balance), 0), 0);
+  // مصدر الحقيقة: customer_balances، ومع غيابه يُستخدم customers.balance (نفس منطق بقية الشاشات)
+  const ledger = new Map((balR.data ?? []).map((b) => [b.customer_id, num(b.current_balance)]));
+  const outstanding = customers.reduce(
+    (s, c) => s + Math.max(ledger.has(c.id) ? ledger.get(c.id)! : num(c.balance), 0),
+    0,
+  );
+
 
   const stats = {
     range: { from: from ?? "منذ البداية", to: to ? dateOnly(to) : "حتى الآن" },
