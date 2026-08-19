@@ -713,7 +713,7 @@ async function summaryStats(supabase: DB, args: Record<string, unknown>): Promis
   if (from) prodQ = prodQ.gte("logged_at", from);
   if (to) prodQ = prodQ.lte("logged_at", to);
 
-  const [billsR, paysR, readsR, prodR, custR, balR] = await Promise.all([
+  const [billsR, paysR, readsR, prodR, custR, balR, unpaidR] = await Promise.all([
     billsQ.limit(5000).returns<Array<{ total: number; paid_amount: number; status: string }>>(),
     paysQ.limit(5000).returns<Array<{ amount: number; status: string }>>(),
     readsQ.limit(5000).returns<Array<{ consumption: number | null; status: string }>>(),
@@ -722,6 +722,8 @@ async function summaryStats(supabase: DB, args: Record<string, unknown>): Promis
       .returns<Array<{ id: string; status: string; balance: number }>>(),
     supabase.from("customer_balances").select(sel("customer_id, current_balance")).limit(5000)
       .returns<Array<{ customer_id: string; current_balance: number }>>(),
+    supabase.from("water_bills").select(sel("total, paid_amount, status")).neq("status", "paid").limit(5000)
+      .returns<Array<{ total: number; paid_amount: number; status: string }>>(),
   ]);
 
   const bills = billsR.data ?? [];
@@ -732,12 +734,13 @@ async function summaryStats(supabase: DB, args: Record<string, unknown>): Promis
   const consumed = reads.reduce((s, r) => s + num(r.consumption), 0);
   const produced = (prodR.data ?? []).reduce((s, p) => s + num(p.produced_m3), 0);
   const customers = custR.data ?? [];
-  // مصدر الحقيقة: customer_balances، ومع غيابه يُستخدم customers.balance (نفس منطق بقية الشاشات)
-  const ledger = new Map((balR.data ?? []).map((b) => [b.customer_id, num(b.current_balance)]));
-  const outstanding = customers.reduce(
-    (s, c) => s + Math.max(ledger.has(c.id) ? ledger.get(c.id)! : num(c.balance), 0),
+  // مصدر الحقيقة للأرصدة: سجل customer_balances، ومع غيابه المتبقي على الفواتير غير المسددة (نفس منطق لوحة المؤشرات)
+  const ledgerTotal = (balR.data ?? []).reduce((s, b) => s + Math.max(num(b.current_balance), 0), 0);
+  const unpaidTotal = (unpaidR.data ?? []).reduce(
+    (s, b) => s + Math.max(num(b.total) - num(b.paid_amount), 0),
     0,
   );
+  const outstanding = ledgerTotal > 0 ? ledgerTotal : unpaidTotal;
 
 
   const stats = {
@@ -817,22 +820,27 @@ async function rankCustomers(supabase: DB, args: Record<string, unknown>): Promi
     if (error) return fail(error.message);
     for (const b of data ?? []) add(b.customer_id, num(b.total));
   } else {
-    const [{ data: bal }, { data: custs }] = await Promise.all([
+    const [{ data: bal }, { data: unpaid }] = await Promise.all([
       supabase
         .from("customer_balances")
         .select(sel("customer_id, current_balance"))
         .limit(5000)
         .returns<Array<{ customer_id: string; current_balance: number }>>(),
       supabase
-        .from("customers")
-        .select(sel("id, balance"))
+        .from("water_bills")
+        .select(sel("customer_id, total, paid_amount, status"))
+        .neq("status", "paid")
         .limit(5000)
-        .returns<Array<{ id: string; balance: number }>>(),
+        .returns<Array<{ customer_id: string; total: number; paid_amount: number }>>(),
     ]);
-    const ledger = new Map((bal ?? []).map((b) => [b.customer_id, num(b.current_balance)]));
-    for (const c of custs ?? []) {
-      const v = ledger.has(c.id) ? ledger.get(c.id)! : num(c.balance);
-      if (v !== 0) add(c.id, v);
+    const ledgerRows = (bal ?? []).filter((b) => num(b.current_balance) > 0);
+    if (ledgerRows.length > 0) {
+      for (const b of ledgerRows) add(b.customer_id, num(b.current_balance));
+    } else {
+      for (const b of unpaid ?? []) {
+        const rest = num(b.total) - num(b.paid_amount);
+        if (rest > 0) add(b.customer_id, rest);
+      }
     }
   }
 
