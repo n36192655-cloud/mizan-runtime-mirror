@@ -1,153 +1,157 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState, useRef, useEffect } from "react";
+import { useServerFn } from "@tanstack/react-start";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Send, User, RefreshCw } from "lucide-react";
-import { answerQuestion, type AiResponse } from "@/lib/ai-intent";
-import { AiResponseRenderer } from "@/components/ai-response";
+import { Send, User, Loader2 } from "lucide-react";
+import { askAssistant, type AssistantTable, type AssistantTurn } from "@/lib/assistant.functions";
+import { AssistantAnswerView } from "@/components/assistant-answer";
 import { MizanAiIcon } from "@/components/mizan-ai-icon";
-import { syncPending } from "@/lib/sync";
-import { getContext } from "@/lib/assistant/conversation-context";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/assistant")({
-  head: () => ({ meta: [{ title: "ميزان الذكي" }] }),
+  head: () => ({
+    meta: [
+      { title: "ميزان الذكي — مساعد تحليل بيانات المياه" },
+      { name: "description", content: "مساعد ذكي يجيب بالعربية عن المشتركين والعدادات والفواتير والمدفوعات والمتأخرات والتحصيل من أحدث بيانات المنصة." },
+      { property: "og:title", content: "ميزان الذكي — مساعد تحليل بيانات المياه" },
+      { property: "og:description", content: "اسأل بالعربية الطبيعية عن أي مشترك أو مؤشر تشغيلي واحصل على إجابة مبنية على بيانات القاعدة مباشرة." },
+    ],
+  }),
   component: AssistantPage,
 });
 
 interface UserMsg { role: "user"; text: string }
-interface AssistantMsg { role: "assistant"; response: AiResponse }
+interface AssistantMsg { role: "assistant"; text: string; tables: AssistantTable[] }
 type Msg = UserMsg | AssistantMsg;
 
 const DEFAULT_SUGGESTIONS = [
-  "استعلام عن مشترك",
-  "كشف حساب مشترك",
-  "تحليل الفاقد لهذا الشهر",
-  "من دفع ومن لم يدفع؟",
-  "استعلام عن التحصيل اليوم",
-  "كم إجمالي الديون؟",
-  "ما أكثر المشتركين تأخراً؟",
-  "أعلى مستهلك",
+  "كشف حساب المشترك أحمد",
+  "من عليه أكبر مديونية؟",
+  "كم حصّلنا هذا الشهر؟",
+  "أعلى ٥ مشتركين استهلاكاً هذا العام",
+  "المشتركون الجدد هذا الشهر",
+  "الفواتير غير المسددة",
 ];
 
-function getContextualSuggestions(): string[] {
-  const ctx = getContext();
-  if (ctx.currentCustomer) {
-    return [
-      "كشف حساب المشترك",
-      "كم المتبقي عليه؟",
-      "آخر فاتورة",
-      "آخر دفعة",
-      "آخر قراءة؟",
-      "سجل القراءات",
-      "قارن استهلاكه",
-      "هل دفع آخر فاتورة؟",
-    ];
-  }
-  if (ctx.currentReport === "revenue_report") {
-    return ["تحصيل اليوم", "تحصيل هذا الأسبوع", "تحصيل هذا الشهر", "أعلى مدين", "أعلى مستهلك"];
-  }
-  if (ctx.currentReport === "loss_analysis") {
-    return ["تحليل الفاقد اليوم", "تحليل الفاقد هذا الأسبوع", "كم إنتاج المياه؟", "كم عدد المشتركين؟"];
-  }
-  if (ctx.currentReport === "payment_status") {
-    return ["كم إجمالي الديون؟", "ما أكثر المشتركين تأخراً؟", "استعلام عن التحصيل اليوم"];
-  }
-  return DEFAULT_SUGGESTIONS;
-}
+const WELCOME =
+  "أهلاً بك في «ميزان الذكي». اسألني بالعربية الطبيعية عن أي مشترك (بالاسم أو رقم الحساب أو الهاتف أو رقم العداد)، أو عن القراءات والفواتير والمدفوعات والمتأخرات والتحصيل والاستهلاك — وسأجيبك من أحدث بيانات القاعدة مباشرة.";
 
 function AssistantPage() {
+  const ask = useServerFn(askAssistant);
   const [messages, setMessages] = useState<Msg[]>([
-    {
-      role: "assistant",
-      response: {
-        kind: "suggestions",
-        text: "أهلاً بك في «ميزان الذكي» — مستشارك الرقمي لتحليل الشبكة واتخاذ القرارات. اختر تقريراً أو اطرح سؤالاً:",
-        suggestions: getContextualSuggestions(),
-      },
-    },
+    { role: "assistant", text: WELCOME, tables: [] },
   ]);
+  const [suggestions, setSuggestions] = useState<string[]>(DEFAULT_SUGGESTIONS);
   const [input, setInput] = useState("");
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [busy, setBusy] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
-  const lastUserRef = useRef<string>("");
 
   useEffect(() => {
     if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
-  }, [messages]);
+  }, [messages, busy]);
 
-  function send(q: string) {
-    const trimmed = q.trim();
-    if (!trimmed) return;
-    lastUserRef.current = trimmed;
-    setMessages((m) => [...m, { role: "user", text: trimmed }]);
+  async function send(q: string) {
+    const question = q.trim();
+    if (!question || busy) return;
+    const history: AssistantTurn[] = messages
+      .slice(1)
+      .map((m) => ({ role: m.role, content: m.role === "user" ? m.text : m.text }));
+
+    setMessages((m) => [...m, { role: "user", text: question }]);
     setInput("");
-    setTimeout(() => {
-      const response = answerQuestion(trimmed);
-      setMessages((m) => [...m, { role: "assistant", response }]);
-    }, 150);
-  }
-
-  function refresh() {
-    void syncPending().then(({ synced }) => {
-      toast.success(synced > 0 ? `تمت مزامنة ${synced} إدخال معلّق` : "تم التحديث");
-    });
-    setRefreshKey((k) => k + 1);
-    const lastUser = lastUserRef.current;
-    if (lastUser) {
-      const response = answerQuestion(lastUser);
-      setMessages((m) => {
-        const last = m[m.length - 1];
-        if (last && last.role === "assistant") return [...m.slice(0, -1), { role: "assistant", response }];
-        return [...m, { role: "assistant", response }];
-      });
+    setBusy(true);
+    try {
+      const res = await ask({ data: { question, history } });
+      setMessages((m) => [...m, { role: "assistant", text: res.answer, tables: res.tables }]);
+      setSuggestions(res.suggestions.length > 0 ? res.suggestions : DEFAULT_SUGGESTIONS);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "تعذّر تنفيذ الطلب";
+      toast.error(message);
+      setMessages((m) => [...m, { role: "assistant", text: `تعذّر تنفيذ الطلب: ${message}`, tables: [] }]);
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
     <div className="space-y-4">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold flex items-center gap-2">
-            <MizanAiIcon size={32} /> ميزان الذكي
-          </h1>
-          <p className="text-sm text-muted-foreground mt-1">مستشار ميزان الرقمي — تحليل ذكي وقرارات فورية</p>
-        </div>
+      <div>
+        <h1 className="text-2xl md:text-3xl font-bold flex items-center gap-2">
+          <MizanAiIcon size={32} /> ميزان الذكي
+        </h1>
+        <p className="text-sm text-muted-foreground mt-1">
+          مساعد ذكي يفهم العربية ويستعلم مباشرة من قاعدة البيانات ضمن صلاحياتك
+        </p>
       </div>
 
-      <Card className="flex flex-col h-[70vh]" key={refreshKey}>
-        <CardHeader className="border-b py-3 flex flex-row items-center justify-between">
+      <Card className="flex flex-col h-[72vh]">
+        <CardHeader className="border-b py-3">
           <CardTitle className="text-sm flex items-center gap-2">
             <MizanAiIcon size={18} /> مستشار ميزان الرقمي
           </CardTitle>
-          <Button size="sm" variant="ghost" onClick={refresh} title="تحديث ومزامنة">
-            <RefreshCw className="w-4 h-4 ms-1" /> تحديث ومزامنة
-          </Button>
         </CardHeader>
         <CardContent className="flex-1 overflow-y-auto p-4 space-y-4" ref={boxRef}>
           {messages.map((m, i) => (
             <div key={i} className={`flex gap-2 ${m.role === "user" ? "flex-row-reverse" : ""}`}>
-              <div className={`w-8 h-8 rounded-full grid place-items-center shrink-0 ${m.role === "user" ? "bg-primary text-primary-foreground" : "bg-muted"}`}>
+              <div
+                className={`w-8 h-8 rounded-full grid place-items-center shrink-0 ${
+                  m.role === "user" ? "bg-primary text-primary-foreground" : "bg-muted"
+                }`}
+              >
                 {m.role === "user" ? <User className="w-4 h-4" /> : <MizanAiIcon size={20} />}
               </div>
-              <div className={`max-w-[90%] ${m.role === "user" ? "rounded-lg px-3 py-2 text-sm bg-primary text-primary-foreground" : "flex-1"}`}>
-                {m.role === "user" ? m.text : <AiResponseRenderer response={m.response} onSuggestion={send} />}
+              <div
+                className={
+                  m.role === "user"
+                    ? "max-w-[90%] rounded-lg px-3 py-2 text-sm bg-primary text-primary-foreground"
+                    : "flex-1 max-w-[90%]"
+                }
+              >
+                {m.role === "user" ? m.text : <AssistantAnswerView answer={m.text} tables={m.tables} />}
               </div>
             </div>
           ))}
+          {busy && (
+            <div className="flex gap-2 items-center text-sm text-muted-foreground">
+              <div className="w-8 h-8 rounded-full grid place-items-center bg-muted">
+                <MizanAiIcon size={20} />
+              </div>
+              <Loader2 className="w-4 h-4 animate-spin" /> يحلل البيانات…
+            </div>
+          )}
         </CardContent>
         <div className="border-t p-3 space-y-2">
           <div className="flex flex-wrap gap-1.5">
-            {getContextualSuggestions().map((s) => (
-              <button key={s} onClick={() => send(s)} className="text-xs px-2.5 py-1 rounded-full border hover:bg-primary/10 hover:border-primary/40 transition-colors">
+            {suggestions.map((s) => (
+              <button
+                key={s}
+                type="button"
+                disabled={busy}
+                onClick={() => void send(s)}
+                className="text-xs px-2.5 py-1 rounded-full border hover:bg-primary/10 hover:border-primary/40 transition-colors disabled:opacity-50"
+              >
                 {s}
               </button>
             ))}
           </div>
-          <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); send(input); }}>
-            <Input value={input} onChange={(e) => setInput(e.target.value)} placeholder="اكتب سؤالك بالعربية…" />
-            <Button type="submit" size="icon"><Send className="w-4 h-4" /></Button>
+          <form
+            className="flex gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void send(input);
+            }}
+          >
+            <Input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="اكتب سؤالك بالعربية…"
+              disabled={busy}
+            />
+            <Button type="submit" size="icon" disabled={busy || !input.trim()}>
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+            </Button>
           </form>
         </div>
       </Card>
